@@ -1,0 +1,256 @@
+# moonshotai/Kimi-K2.7-Code @ 74797c9c62378b951a1f6fcf5c4631024e9b8bef
+# Architecture: KimiK25ForConditionalGeneration wrapping DeepseekV3ForCausalLM.
+# In plain words: MLA attention + mixture-of-experts. Same text model and same
+# storage precision as the kimi-k2.5 entry already in this catalogue.
+# Files I read: config.json, model.safetensors.index.json, modeling_kimi_k25.py,
+# modeling_deepseek.py. No traces, no third-party writeups.
+#
+# This file is standalone so it can be read outside the repo. Inside the
+# catalogue it could be `extends: kimi-k2.5` with an empty spec, because every
+# spec value below matches that entry. I use family glm_moe_dsa because it is
+# the graph that models MLA + MoE. Kimi has no DSA indexer, so it is switched
+# off on every layer (all 'shared', index_topk = max_position_embeddings).
+#
+# BASELINE vs CHECKPOINT - the baseline says "FP8 weights and KV where the checkpoint
+# supports it". The checkpoint supports FP8 nowhere. Routed experts are int4
+# (group 32, symmetric). Everything on the ignore list is bf16.
+# kv_cache_scheme is null. The original K2-Instruct was block-fp8, but that is
+# family history, not this checkpoint.
+#
+# CONFIG RED HERRING - num_key_value_heads is 64 in the config. Read naively, that means
+# 20,480 bytes of cache per token per layer. It is a red herring: MLA caches one
+# 512-wide latent plus one shared 64-wide RoPE key = 576 elements.
+
+name: moonshotai/Kimi-K2.7-Code
+family: glm_moe_dsa
+description: >
+  61 layers, hidden size 7168. MLA attention: one 512-wide latent plus a 64-wide
+  RoPE key per token, shared by all 64 heads. No sparse-attention indexer.
+  Layer 0 is a dense FFN (18432 wide). Layers 1-60 are MoE: 384 routed experts,
+  top-8 with sigmoid noaux_tc scoring, plus one shared expert, each 2048 wide.
+  Routed experts are int4 (compressed-tensors W4A16, group 32, bf16 scales).
+  Everything else is bf16. No FP8 tensors. No MTP weights. The vision tower is
+  in the checkpoint but a text decode step never uses it.
+
+spec:
+  hidden: 7168
+  n_layers: 61
+  vocab: 163840
+
+  # MLA attention, the standard DeepSeek-V3 shape. Ignore num_key_value_heads
+  # (64) in the config: the cache holds one latent plus one RoPE key per token,
+  # shared by all 64 heads.
+  n_heads: 64
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_nope_head_dim: 128
+  qk_rope_head_dim: 64
+  v_head_dim: 128
+
+  # No sparse attention. Every layer is 'shared', which means no layer runs an
+  # indexer, so no indexer compute, weights or cache are counted. index_topk is
+  # set to max_position_embeddings so the top-k limit never applies. The weight
+  # map agrees: it has zero indexer tensors. All 61 entries are written out,
+  # because leaving the list empty makes the planner fall back to a pattern
+  # that adds indexers Kimi does not have.
+  index_n_heads: 0
+  index_head_dim: 0
+  index_topk: 262144
+  indexer_types:
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+
+  # Mixture of experts. Each expert is 2048 wide. Only layer 0 is a dense FFN
+  # (18432 wide). The weight map confirms it: experts on layers 1-60, none on
+  # layer 0, which matches first_k_dense_replace 1.
+  n_routed_experts: 384
+  n_shared_experts: 1
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  intermediate_size: 18432
+  first_k_dense_replace: 1
+  routed_scaling_factor: 2.827
+
+  # No MTP head. The config says 0 and the weight map has no nextn / eh_proj
+  # tensors. Any speculative decoding would need a separate draft model.
+  num_nextn_predict_layers: 0
+
+  # Precision. Only the routed experts are quantised: int4, symmetric, group 32,
+  # with one bf16 scale per group (0.5 + 2/32 = 0.5625 bytes per weight). The
+  # ignore list keeps attention, the shared expert, the dense FFN and lm_head
+  # at bf16, so the shared expert is pinned back to bf16 below.
+  weight_dtype: bf16
+  expert_dtype: int4
+  # The config has no KV scheme and dtype is bfloat16, so bf16 is what the
+  # checkpoint supports. An FP8 cache is a serving choice - see open Q1.
+  kv_dtype: bf16
+  act_dtype: bf16
+  op_dtype_overrides:
+    - [moe_shared, bf16]
+
+  # Under TP there are two all-reduces per layer (after attention, after MoE):
+  # 61 x 2 = 122 per step. This is a TP convention, not a checkpoint fact.
+
+provenance:
+  verified:
+    - claim: the text model has the same shape as kimi-k2.5
+      detail: >
+        Read from config.json text_config at 74797c9 on 2026-09-20:
+        hidden_size 7168, num_hidden_layers 61, num_attention_heads 64,
+        q_lora_rank 1536, kv_lora_rank 512, qk_nope/rope/v 128/64/128,
+        n_routed_experts 384, num_experts_per_tok 8, n_shared_experts 1,
+        moe_intermediate_size 2048, intermediate_size 18432,
+        first_k_dense_replace 1, moe_layer_freq 1, routed_scaling_factor 2.827,
+        vocab_size 163840, num_nextn_predict_layers 0. I diffed this config
+        against moonshotai/Kimi-K2.5 field by field. Only three things differ,
+        and none touch shape or precision: eos_token_id 163585 -> 163586 (in
+        two places), and the vision_tower / mm_projector ignore patterns gain a
+        leading '.*'.
+    - claim: which layers are dense and which are MoE, read from the weight map
+      detail: >
+        The index has 208,550 tensors in 64 shards. Layer 0 is the only layer
+        with mlp.{gate,up,down}_proj.weight, so it is dense. Layers 1-60 have
+        mlp.experts.{0..383}.{gate,up,down}_proj.{weight_packed, weight_scale,
+        weight_shape} (23,040 of each = 60 x 384), plus mlp.shared_experts.*,
+        mlp.gate.weight and mlp.gate.e_score_correction_bias. Every layer has
+        the same seven MLA tensors: q_a_proj, q_a_layernorm, q_b_proj,
+        kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj. There are no
+        indexer tensors and no nextn/mtp/eh_proj tensors. lm_head and
+        embed_tokens are separate (tie_word_embeddings false).
+    - claim: my weight total matches the published size
+      detail: >
+        The index says total_size = 595,148,192,736 B (595.15 GB), the same
+        number the kimi-k2.5 entry records. My hand calculation: routed experts
+        7168 x 2048 x 3 x 0.5625 B x 384 x 60 = 570.76 GB. The bf16 rest is
+        23.44 GB (attention 12.34, shared expert 5.28, embed + lm_head 4.70,
+        dense FFN 0.79, router 0.33). Sum 594.20 GB, which is 0.16% under. The
+        gap is the vision tower, mm_projector, norms and weight_shape tensors.
+    - claim: the modeling code runs the same ops as kimi-k2.5
+      detail: >
+        modeling_deepseek.py differs only by an import fallback and one unused
+        line commented out in the MoE forward. modeling_kimi_k25.py differs
+        only in transformers-version compatibility (Cache handling,
+        _supports_flash_attn, tie_weights signature). The attention, router and
+        expert math are unchanged.
+
+  estimated:
+    - field: weight_scale dtype
+      value: bf16 (2 bytes per group of 32)
+      detail: >
+        Neither the index nor the config states the scale dtype. With bf16 my
+        total lands within 0.16% of total_size. With fp32 scales it would be
+        about 63 GB too high. This can be confirmed from a safetensors shard
+        header without downloading the weights.
+    - field: MLA absorption (is kv_b_proj its own matmul at decode?)
+      value: not absorbed, same as the kimi-k2.5 entry
+      detail: >
+        The checkpoint stores kv_b_proj as its own tensor, and that is all it
+        tells us. Whether decode runs it as a separate GEMM or folds it into
+        the attention kernel is the engine's choice. I settle that in Part 2
+        and do not claim it here.
+    - field: moe_router precision
+      value: bf16 (follows weight_dtype), same as the kimi-k2.5 entry
+      detail: >
+        The modeling code scores with sigmoid over mlp.gate.weight plus
+        e_score_correction_bias. The index has no dtype for it. Engines often
+        score in fp32. It is about 2.75M weights per layer, so it does not
+        change the ranking either way.
+    - field: all-reduces per layer under TP8
+      value: 2 (after attention, after MoE), so 122 per decode step
+      detail: >
+        This is how TP normally works, not something the checkpoint says. Each
+        one carries 32 x 7168 x 2 B = 0.46 MB. It can be checked by counting
+        all-reduce kernels per step in a trace.
+
+  open:
+    - question: KV cache dtype - 1 or 2 bytes per element
+      detail: >
+        kv_cache_scheme is null. The checkpoint gives no FP8 KV scales, but it
+        does not forbid an FP8 cache either. At the baseline (32 x 8,192 tokens,
+        576 elements x 61 layers) the cache is 18.42 GB at bf16 or 9.21 GB at
+        fp8. Under TP every GPU holds a full copy, because the latent has no
+        per-head part to split. The engine launch args decide this.
+    - question: are the experts run with TP only, or with expert parallelism
+      detail: >
+        Memory per GPU is the same either way (1/8 of 570.76 GB). The
+        communication is not: with EP an all-to-all dispatch/combine replaces
+        the post-MoE all-reduce, and uneven routing starts to matter. That has
+        to be measured from a trace, not predicted.
+    - question: how many different experts a step really touches per layer
+      detail: >
+        32 tokens x top-8 = 256 picks over 384 experts. It can be as few as 8
+        or as many as 256. With uniform, independent routing I expect 188. Real
+        routing is neither. Not determinable from the checkpoint.
+    - question: is speculation or a draft model used in production
+      detail: >
+        The checkpoint has no MTP head. The case baseline turns speculation
+        off, but a real operator might not.
+
+  unmodelled:
+    - The vision tower (27 blocks, vt_hidden_size 1152) and mm_projector. A text
+      decode step never enters them. Whether their weights sit on every GPU is
+      an engine decision.
+    - Activation dtype inside the expert GEMMs. W4A16 means int4 weights are
+      turned back into bf16 for the math (input_activations is null). I price
+      weight traffic at int4 + scales and the math at bf16.
+    - Host-side launch overhead. My ranking assumes the decode step runs under
+      CUDA graphs. If the engine runs eager, that overhead could matter (Part 2).
